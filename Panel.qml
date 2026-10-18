@@ -41,7 +41,18 @@ Panel {
   }
 
   function close() {
-    if (root.status === "loading") lookupProc.running = false
+    if (root.status === "loading") {
+      root.lookupGeneration++
+      root.lookupCancelled = true
+      root.lookupPending = false
+      lookupProc.running = false
+      root.status = "idle"
+    }
+    root.glossGeneration++
+    root.glossCancelled = true
+    root.glossPending = false
+    if (chineseGlossProc.running) chineseGlossProc.running = false
+    root.stopPronunciation()
     root.controller.hide()
   }
 
@@ -83,10 +94,26 @@ Panel {
   property string statusMessage: ""
   property int variants: 0               // > 1 when the API returned more than one entry object
 
-  // Target language for lookups. Driven by the dropdown in the popup
-  // header; default comes from Model.defaultLanguage so the panel and
-  // data layer stay in sync.
-  property string language: Model.defaultLanguage ? Model.defaultLanguage() : "en"
+  // Detect the input script for each query. Chinese uses a Chinese-English
+  // dictionary; English retains its pronunciation and bilingual definitions.
+  property string language: "en"
+  property var chineseMeanings: []
+  property string chineseGlossQuery: ""
+  property string chineseGlossStatus: "idle"
+  property var glossAdapterQueue: []
+  property int glossAdapterIndex: 0
+  property bool glossInFlight: false
+  property bool glossOutputReady: false
+  property bool glossExited: false
+  property bool glossPending: false
+  property bool glossCancelled: false
+  property int glossGeneration: 0
+  property string glossOutput: ""
+  property string pronunciationState: "idle"
+  property string pronunciationQuery: ""
+  property string preparedPronunciationQuery: ""
+  property string pronunciationDownloadUrl: ""
+  property string pronunciationFallbackUrl: ""
 
   // ---- Fuzzy state. Populated only when the user's exact query was a 404
   //      and the local wordlist surfaced closer candidates. suggestions is
@@ -104,13 +131,19 @@ Panel {
   property bool programmaticEdit: false
 
   // ---- Adapter chain. Model.adaptersFor(language) returns the ordered list
-  //      of dictionary sources for the current language — e.g. English
-  //      resolves to [webster1913, wiktionary], offline-first with a network
-  //      fallback. The panel tries the chain in order; the first ok result
-  //      wins and any other outcome advances to the next adapter. Adding a
-  //      future source is a new adapter plus one line in Model.js.
+  //      of dictionary sources for the current language — English prefers
+  //      Free Dictionary for modern definitions and audio, then falls back
+  //      to bundled Webster and Wiktionary. The first ok result wins.
   property var adapterQueue: []
   property int adapterIndex: 0
+  property bool lookupInFlight: false
+  property bool lookupOutputReady: false
+  property bool lookupExited: false
+  property bool lookupPending: false
+  property bool lookupCancelled: false
+  property string lookupOutput: ""
+  property int lookupExitCode: 0
+  property int lookupGeneration: 0
 
   // True once the hotkey script is confirmed installed — "installed" after
   // a successful click-to-install this session, "up-to-date" when the
@@ -128,11 +161,17 @@ Panel {
 
   readonly property string heroSummary: entry ? Model.summaryLabel(entry) : ""
   // Build tag shown in the popup's bottom-right corner so we can visually
-  // confirm which build is loaded. Bump to "v0.2-dev" when iterating.
+  // confirm which build is loaded. This is distinct from manifest version.
   readonly property string buildVersion: "v0.2"
   readonly property int panelWidth: Style.space(420)
   readonly property int panelMaxHeight: Style.space(620)
   readonly property int searchDelayMs: 250
+  readonly property string audioRuntimeDir: {
+    var dir = String(Quickshell.env("XDG_RUNTIME_DIR") || "")
+    return dir !== "" ? dir : "/tmp"
+  }
+  readonly property string audioSourcePath: audioRuntimeDir + "/omarchy-dictionary-pronunciation.source"
+  readonly property string audioPaddedPath: audioRuntimeDir + "/omarchy-dictionary-pronunciation.wav"
 
   // Bundled offline dictionary data (data/webster). Same URL-to-path
   // treatment as BarWidget's scriptPath: Qt.resolvedUrl returns a
@@ -143,11 +182,29 @@ Panel {
     var raw = url.replace(/^file:\/\//, "/")
     try { return decodeURIComponent(raw) } catch (e) { return raw }
   }
+  readonly property string cedictDir: {
+    var url = String(Qt.resolvedUrl("data/cedict"))
+    var raw = url.replace(/^file:\/\//, "/")
+    try { return decodeURIComponent(raw) } catch (e) { return raw }
+  }
+  readonly property string ecdictDir: {
+    var url = String(Qt.resolvedUrl("data/ecdict"))
+    var raw = url.replace(/^file:\/\//, "/")
+    try { return decodeURIComponent(raw) } catch (e) { return raw }
+  }
 
   // ---- Reset all result-related state back to idle. Called from search(),
   //      runLookup(), applyEdited(), and the language-change handler.
   function resetResults() {
+    root.glossGeneration++
+    root.glossCancelled = true
+    root.glossPending = false
+    if (chineseGlossProc.running) chineseGlossProc.running = false
+    root.stopPronunciation()
     root.entry = null
+    root.chineseMeanings = []
+    root.chineseGlossQuery = ""
+    root.chineseGlossStatus = "idle"
     root.variants = 0
     root.status = "idle"
     root.statusMessage = ""
@@ -163,6 +220,10 @@ Panel {
       Model.setWordlist(Wordlist.ENGLISH_WORDLIST)
     if (typeof Model.setDataDir === "function")
       Model.setDataDir(root.dataDir)
+    if (typeof Model.setCedictDir === "function")
+      Model.setCedictDir(root.cedictDir)
+    if (typeof Model.setEcdictDir === "function")
+      Model.setEcdictDir(root.ecdictDir)
   }
 
   // ---- Bindings need the source data checked before any property
@@ -178,6 +239,133 @@ Panel {
   }
   function entryPhonetic() {
     return root.entry ? String(root.entry.phonetic || "") : ""
+  }
+  function entryAudioUrl() {
+    return root.entry ? String(root.entry.audioUrl || "") : ""
+  }
+  function entryAudioSourceUrl() {
+    return root.entry ? String(root.entry.audioSourceUrl || "") : ""
+  }
+  function stopPronunciation() {
+    if (audioResolver.running) audioResolver.running = false
+    if (audioDownload.running) audioDownload.running = false
+    if (audioPadding.running) audioPadding.running = false
+    if (pronunciationPlayer.running) pronunciationPlayer.running = false
+    root.pronunciationState = "idle"
+    root.pronunciationQuery = ""
+    root.preparedPronunciationQuery = ""
+    root.pronunciationDownloadUrl = ""
+    root.pronunciationFallbackUrl = ""
+  }
+  function playPreparedPronunciation() {
+    pronunciationPlayer.command = [
+      "pw-play", "--latency", "100ms", root.audioPaddedPath
+    ]
+    root.pronunciationState = "playing"
+    pronunciationPlayer.running = true
+  }
+  function downloadPronunciation(url) {
+    var source = String(url || "").trim()
+    if (source === "") {
+      root.pronunciationState = "error"
+      return
+    }
+    root.pronunciationDownloadUrl = source
+    audioDownload.command = [
+      "curl", "-fsSL", "--connect-timeout", "2", "--max-time", "12",
+      "--retry", "2", "--retry-delay", "1",
+      "-H", "User-Agent: omarchy-dictionary/1.0",
+      "-o", root.audioSourcePath, source
+    ]
+    root.pronunciationState = "downloading"
+    audioDownload.running = true
+  }
+  function playPronunciation() {
+    if (root.preparedPronunciationQuery === root.query) {
+      root.playPreparedPronunciation()
+      return
+    }
+    root.pronunciationQuery = root.query
+    root.pronunciationFallbackUrl = root.entryAudioUrl()
+    var args = Model.commonsAudioArgs(entryAudioSourceUrl())
+    if (args.length > 0) {
+      if (audioResolver.running) audioResolver.running = false
+      audioResolver.command = args
+      root.pronunciationState = "resolving"
+      audioResolver.running = true
+      return
+    }
+    root.downloadPronunciation(entryAudioUrl())
+  }
+
+  function runChineseGlossLookup() {
+    if (root.language !== "en") return
+    root.glossGeneration++
+    root.chineseGlossQuery = root.query
+    root.chineseGlossStatus = "loading"
+    root.glossAdapterQueue = Model.chineseGlossAdaptersFor(root.language)
+    root.glossAdapterIndex = 0
+    if (root.glossInFlight) {
+      root.glossPending = true
+      root.glossCancelled = true
+      chineseGlossProc.running = false
+      return
+    }
+    root.glossCancelled = false
+    root.runGlossAdapter()
+  }
+
+  function runGlossAdapter() {
+    while (root.glossAdapterIndex < root.glossAdapterQueue.length) {
+      var adapter = root.glossAdapterQueue[root.glossAdapterIndex]
+      var args = []
+      try { args = adapter.argsFor(root.chineseGlossQuery, root.language) || [] }
+      catch (e) { console.warn("omarchy-dictionary: gloss adapter args failed:", e) }
+      if (args.length > 0) {
+        root.glossInFlight = true
+        root.glossOutputReady = false
+        root.glossExited = false
+        root.glossOutput = ""
+        chineseGlossProc.command = args
+        chineseGlossProc.running = true
+        return
+      }
+      root.glossAdapterIndex++
+    }
+    root.chineseGlossStatus = "none"
+  }
+
+  function queueGlossAdapterRun() {
+    var generation = root.glossGeneration
+    Qt.callLater(function() {
+      if (root.glossGeneration !== generation || root.glossInFlight ||
+          root.status !== "ok" || root.chineseGlossStatus !== "loading") return
+      root.runGlossAdapter()
+    })
+  }
+
+  function finishGlossIfReady() {
+    if (!root.glossInFlight || !root.glossOutputReady || !root.glossExited) return
+    root.glossInFlight = false
+    if (root.glossPending) {
+      root.glossPending = false
+      root.glossCancelled = false
+      root.queueGlossAdapterRun()
+      return
+    }
+    if (root.glossCancelled || root.status !== "ok" ||
+        root.chineseGlossQuery !== root.query) return
+    var adapter = root.glossAdapterQueue[root.glossAdapterIndex]
+    var result = null
+    try { result = adapter.parse(root.glossOutput, root.chineseGlossQuery, root.language) }
+    catch (e) { console.warn("omarchy-dictionary: gloss adapter parse failed:", e) }
+    if (result && result.ok) {
+      root.chineseMeanings = result.meanings
+      root.chineseGlossStatus = "ok"
+      return
+    }
+    root.glossAdapterIndex++
+    root.queueGlossAdapterRun()
   }
 
   // ---- Focus handling. The field owns initial focus; Esc redirects to close.
@@ -196,29 +384,40 @@ Panel {
   //      stale response can't overwrite the newer one. Each adapter writes
   //      to stdout; we parse it once on completion and advance down the
   //      chain until one succeeds.
-  function runLookup() {
+  function runLookup(preserveRecovery) {
+    root.lookupGeneration++
     var q = String(searchField.text || "").trim()
     root.query = q
+    var oldOriginal = preserveRecovery ? root.originalQuery : ""
+    var oldAutoMatch = preserveRecovery === true && root.isAutoMatched
+    root.resetResults()
     if (q === "") {
+      root.lookupCancelled = true
+      root.lookupPending = false
       lookupProc.running = false
-      root.resetResults()
       return
     }
+    root.originalQuery = oldOriginal
+    root.isAutoMatched = oldAutoMatch
+    root.language = Model.lookupLanguage(q)
     root.adapterQueue = (typeof Model.adaptersFor === "function")
       ? Model.adaptersFor(root.language) : []
     root.adapterIndex = 0
-
     root.status = "loading"
-    root.statusMessage = ""
-    root.resetResults()
-    root.status = "loading"
+    if (root.lookupInFlight) {
+      root.lookupPending = true
+      root.lookupCancelled = true
+      lookupProc.running = false
+      return
+    }
+    root.lookupCancelled = false
     runAdapter()
   }
 
   // Run the current adapter in the chain. Adapters whose argsFor() yields
   // no argv (e.g. the local adapter with no data dir, or an empty query)
   // are skipped without touching the process.
-  function runAdapter() {
+  function runAdapter(lastResult) {
     while (root.adapterIndex < root.adapterQueue.length) {
       var adapter = root.adapterQueue[root.adapterIndex]
       var args = []
@@ -228,7 +427,10 @@ Panel {
         console.warn("omarchy-dictionary: adapter", adapter && adapter.id, "argsFor failed:", e)
       }
       if (args.length > 0) {
-        if (lookupProc.running) lookupProc.running = false
+        root.lookupInFlight = true
+        root.lookupOutputReady = false
+        root.lookupExited = false
+        root.lookupOutput = ""
         lookupProc.command = args
         lookupProc.running = true
         return
@@ -236,18 +438,52 @@ Panel {
       root.adapterIndex++
     }
     // No adapter could even start — handle as an exhausted chain.
-    onAdapterChainExhausted({ ok: false, kind: "error", error: "no dictionary source available" })
+    onAdapterChainExhausted(lastResult ||
+      { ok: false, kind: "error", error: "no dictionary source available" })
   }
 
-  // Advance to the next adapter in the chain. Returns true when another
-  // adapter started; false when the chain is exhausted.
-  function tryNextAdapter() {
-    root.adapterIndex++
-    if (root.adapterIndex < root.adapterQueue.length) {
-      runAdapter()
-      return true
+  // Wait for both stdout and exit before using a result. This prevents a
+  // failed process from advancing the adapter chain twice.
+  function finishAdapterIfReady() {
+    if (!root.lookupInFlight || !root.lookupOutputReady || !root.lookupExited) return
+    root.lookupInFlight = false
+    if (root.lookupPending) {
+      root.lookupPending = false
+      root.lookupCancelled = false
+      root.queueAdapterRun(null)
+      return
     }
-    return false
+    if (root.lookupCancelled || root.status !== "loading") return
+    var adapter = root.adapterQueue[root.adapterIndex]
+    var result = null
+    try {
+      result = adapter.parse(root.lookupOutput, root.query, root.language)
+    } catch (e) {
+      console.warn("omarchy-dictionary: adapter", adapter && adapter.id, "parse failed:", e)
+    }
+    if (result && result.ok) {
+      root.entry = result.entry
+      root.variants = result.variants || 0
+      root.status = "ok"
+      root.statusMessage = ""
+      if (result.chineseMeanings && result.chineseMeanings.length) {
+        root.chineseMeanings = result.chineseMeanings
+        root.chineseGlossStatus = "ok"
+      } else {
+        root.runChineseGlossLookup()
+      }
+      return
+    }
+    root.adapterIndex++
+    root.queueAdapterRun(result || { ok: false, kind: "error", error: "dictionary response failed" })
+  }
+
+  function queueAdapterRun(lastResult) {
+    var generation = root.lookupGeneration
+    Qt.callLater(function() {
+      if (root.lookupGeneration !== generation || root.lookupInFlight || root.status !== "loading") return
+      root.runAdapter(lastResult)
+    })
   }
 
   // The whole chain failed. `result` is the last adapter's outcome and
@@ -266,7 +502,7 @@ Panel {
         return
       }
       root.originalQuery = root.query
-      var fuzzy = Model.fuzzyMatch(root.query)
+      var fuzzy = root.language === "en" ? Model.fuzzyMatch(root.query) : null
       if (fuzzy && fuzzy.autoMatch) {
         // Rewrite the field to the candidate so the user can see what
         // we fetched, keep it marked "auto", and fetch it. The next
@@ -278,7 +514,7 @@ Panel {
         searchField.text = fuzzy.autoMatch
         root.query = fuzzy.autoMatch
         root.programmaticEdit = false
-        root.runLookup()
+        root.runLookup(true)
         return
       }
       if (fuzzy && fuzzy.alternatives && fuzzy.alternatives.length > 0) {
@@ -303,10 +539,15 @@ Panel {
   // isAutoMatched flag survives into the second lookup.
   function applyEdited() {
     if (root.programmaticEdit) return
+    root.lookupGeneration++
     var q = String(searchField.text || "").trim()
     root.query = q
-    if (q === "") {
+    if (root.lookupInFlight) {
+      root.lookupCancelled = true
+      root.lookupPending = false
       lookupProc.running = false
+    }
+    if (q === "") {
       root.resetResults()
       return
     }
@@ -314,7 +555,7 @@ Panel {
     // Don't auto-fire on every keystroke — the API is rate-limited and
     // half-typed words make noise — but clear any in-flight result so the
     // panel doesn't show stale data next to fresh text.
-    if (root.status === "ok" || root.status === "notfound" || root.status === "error" || root.status === "suggestions") {
+    if (root.status !== "idle") {
       root.resetResults()
     }
   }
@@ -329,29 +570,9 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        if (root.status !== "loading") return
-        var adapter = root.adapterQueue[root.adapterIndex]
-        var result = null
-        try {
-          result = adapter.parse(text, root.query, root.language)
-        } catch (e) {
-          console.warn("omarchy-dictionary: adapter", adapter && adapter.id, "parse failed:", e)
-        }
-        if (result && result.ok) {
-          root.entry = result.entry
-          root.variants = result.variants || 0
-          root.status = "ok"
-          root.statusMessage = ""
-          // originalQuery stays put when isAutoMatched is true so the
-          // result body can render "showing 'X' for 'Y'".
-        } else if (root.tryNextAdapter()) {
-          // A miss or failure in one adapter falls through to the next —
-          // e.g. a word missing from the local Webster's is retried
-          // against Wiktionary when online.
-          return
-        } else {
-          root.onAdapterChainExhausted(result)
-        }
+        root.lookupOutput = text
+        root.lookupOutputReady = true
+        root.finishAdapterIfReady()
       }
     }
     stderr: StdioCollector {
@@ -359,17 +580,84 @@ Panel {
       waitForEnd: true
     }
     onExited: function(exitCode) {
-      if (root.status !== "loading") return
-      // Stale exit: the chain already advanced and restarted the process
-      // for the next adapter (its onStreamFinished ran first).
-      if (lookupProc.running) return
-      // The process died without parseable stdout — DNS/TLS/refused
-      // connection for curl, a missing data file for gzip. Advance the
-      // chain; only when every adapter has failed do we surface the error.
-      if (root.tryNextAdapter()) return
-      root.entry = null
-      root.status = "error"
-      root.statusMessage = "could not reach the dictionary service"
+      root.lookupExitCode = exitCode
+      root.lookupExited = true
+      root.finishAdapterIfReady()
+    }
+  }
+
+  Process {
+    id: chineseGlossProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.glossOutput = text
+        root.glossOutputReady = true
+        root.finishGlossIfReady()
+      }
+    }
+    onExited: function(exitCode) {
+      root.glossExited = true
+      root.finishGlossIfReady()
+    }
+  }
+
+  Process {
+    id: audioResolver
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (root.pronunciationQuery !== root.query) return
+        var directUrl = Model.parseCommonsAudioUrl(text)
+        root.downloadPronunciation(directUrl !== "" ? directUrl : root.entryAudioUrl())
+      }
+    }
+  }
+
+  Process {
+    id: audioDownload
+    onExited: function(exitCode) {
+      if (root.pronunciationQuery !== root.query) return
+      if (exitCode !== 0) {
+        if (root.pronunciationFallbackUrl !== "" &&
+            root.pronunciationDownloadUrl !== root.pronunciationFallbackUrl) {
+          root.downloadPronunciation(root.pronunciationFallbackUrl)
+          return
+        }
+        root.pronunciationState = "error"
+        console.warn("omarchy-dictionary: pronunciation download failed")
+        return
+      }
+      audioPadding.command = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", root.audioSourcePath,
+        "-af", "adelay=250:all=1",
+        "-ar", "48000", root.audioPaddedPath
+      ]
+      root.pronunciationState = "padding"
+      audioPadding.running = true
+    }
+  }
+
+  Process {
+    id: audioPadding
+    onExited: function(exitCode) {
+      if (root.pronunciationQuery !== root.query) return
+      if (exitCode !== 0) {
+        root.pronunciationState = "error"
+        console.warn("omarchy-dictionary: pronunciation padding failed")
+        return
+      }
+      root.preparedPronunciationQuery = root.pronunciationQuery
+      root.playPreparedPronunciation()
+    }
+  }
+
+  Process {
+    id: pronunciationPlayer
+    onExited: function(exitCode) {
+      root.pronunciationState = exitCode === 0 ? "idle" : "error"
+      if (exitCode !== 0) console.warn("omarchy-dictionary: pronunciation playback failed")
     }
   }
 
@@ -416,10 +704,10 @@ Column {
       width: parent.width
       spacing: Style.space(14)
 
-        // ---------- Hero: title + entry summary (parts of speech) + lang dropdown
+        // ---------- Hero: title + entry summary
         Item {
           width: parent.width
-          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, languageDropdown.implicitHeight)
+          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight)
 
           Text {
             id: heroIcon
@@ -435,8 +723,7 @@ Column {
             id: heroLabels
             anchors.left: heroIcon.right
             anchors.leftMargin: Style.space(14)
-            anchors.right: languageDropdown.left
-            anchors.rightMargin: Style.space(10)
+            anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(2)
 
@@ -460,7 +747,7 @@ Column {
                 if (root.status === "loading") return "looking up…"
                 if (root.status === "notfound") return "no definition"
                 if (root.status === "error") return "couldn't reach the API"
-                return "look up a word"
+                return "English ↔ 中文"
               }
               textFormat: Text.PlainText
               color: Qt.darker(root.contentForeground, 1.4)
@@ -473,41 +760,6 @@ Column {
             }
           }
 
-          // Language switcher in the top right of the popup. Data-driven
-          // from Model.languages() (sorted alphabetically by English
-          // label in JS) so adding a language is a one-entry edit.
-          // Picking one kicks off a fresh lookup when there's already a
-          // query, so changing language doesn't require retyping the
-          // word.
-          Dropdown {
-            id: languageDropdown
-            value: root.language
-            options: Model.languages()
-            showLabel: false
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            implicitWidth: Style.space(120)
-            onChanged: function(newValue) {
-              if (newValue === root.language) return
-              root.language = newValue
-              // The previously-shown entry (or in-flight lookup) was for
-              // the prior language and is no longer meaningful under the
-              // new one. Cancel any in-flight proc, clear the entry,
-              // empty the search field, and reset to idle so the user
-              // starts fresh with the new language.
-              if (lookupProc.running) lookupProc.running = false
-              var hadResult = root.status === "ok" || root.status === "notfound" ||
-                              root.status === "error" || root.status === "suggestions" ||
-                              root.status === "loading"
-              if (hadResult) {
-                root.resetResults()
-                root.programmaticEdit = true
-                searchField.text = ""
-                root.programmaticEdit = false
-                root.query = ""
-              }
-            }
-          }
         }
 
         // ---------- Search field ----------
@@ -551,7 +803,7 @@ Column {
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.body
                 color: root.contentForeground
-                placeholderText: "Search a word…"
+                placeholderText: "Search English or Chinese…"
                 placeholderTextColor: Qt.darker(root.contentForeground, 2.0)
                 background: null
                 selectByMouse: true
@@ -656,7 +908,7 @@ Column {
 
               Text {
                 width: parent.width
-                text: "Type a word in the field above, then press Enter to look it up."
+                text: "Type an English or Chinese word above, then press Enter."
                 color: Qt.darker(root.contentForeground, 1.3)
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.body
@@ -665,7 +917,7 @@ Column {
 
               Text {
                 width: parent.width
-                text: "Definitions come from *.wiktionary.org/w/api.php* — no account or key required."
+                text: "English and Chinese words have bundled offline definitions and translations; online sources add pronunciation and extra entries."
                 color: Qt.darker(root.contentForeground, 1.7)
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.caption
@@ -852,7 +1104,10 @@ Column {
               font.pixelSize: Style.font.display
               font.bold: true
               elide: Text.ElideRight
-              width: parent.width - phoneticLabel.width - sourceTag.width - Style.space(20)
+              width: Math.max(Style.space(80),
+                parent.width - phoneticLabel.width - sourceTag.width
+                - (pronunciationButton.visible ? pronunciationButton.width + Style.space(10) : 0)
+                - Style.space(20))
               anchors.verticalCenter: parent.verticalCenter
             }
 
@@ -866,6 +1121,19 @@ Column {
               font.italic: true
               anchors.verticalCenter: parent.verticalCenter
               visible: text !== ""
+            }
+
+            Button {
+              id: pronunciationButton
+              iconText: "󰕾"
+              tooltipText: "Play pronunciation"
+              visible: root.entryAudioUrl() !== ""
+              enabled: root.pronunciationState === "idle" || root.pronunciationState === "error"
+              foreground: root.contentForeground
+              horizontalPadding: Style.space(6)
+              verticalPadding: Style.space(4)
+              anchors.verticalCenter: parent.verticalCenter
+              onClicked: root.playPronunciation()
             }
 
             // Small muted source tag (e.g. "Wiktionary") to make it obvious
@@ -902,6 +1170,75 @@ Column {
               id: meaningStack
               width: resultScroll.width
               spacing: Style.space(14)
+
+              Column {
+                width: parent.width
+                spacing: Style.space(8)
+                visible: root.chineseGlossStatus === "loading" || root.chineseMeanings.length > 0
+
+                Text {
+                  text: "中文释义"
+                  color: Color.accent
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  font.letterSpacing: 1.4
+                }
+
+                Text {
+                  visible: root.chineseGlossStatus === "loading"
+                  text: "正在加载…"
+                  color: Qt.darker(root.contentForeground, 1.4)
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                Repeater {
+                  model: root.chineseMeanings
+
+                  Column {
+                    required property var modelData
+                    width: parent.width
+                    spacing: Style.space(4)
+
+                    Text {
+                      text: modelData.partOfSpeech
+                      color: Qt.darker(root.contentForeground, 1.25)
+                      font.family: root.contentFontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    Repeater {
+                      model: modelData.definitions
+                      Text {
+                        required property var modelData
+                        width: parent.width
+                        text: "• " + modelData.definition
+                        textFormat: Text.PlainText
+                        color: root.contentForeground
+                        font.family: root.contentFontFamily
+                        font.pixelSize: Style.font.body
+                        wrapMode: Text.WordWrap
+                      }
+                    }
+                  }
+                }
+
+                PanelSeparator {
+                  foreground: root.contentForeground
+                }
+
+                Text {
+                  visible: root.chineseMeanings.length > 0 && root.entry && root.entry.meanings.length > 0
+                  text: "English definitions"
+                  color: Color.accent
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  font.letterSpacing: 1.4
+                }
+              }
 
               Repeater {
                 model: root.entry ? root.entry.meanings : []

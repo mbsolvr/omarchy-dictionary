@@ -41,6 +41,11 @@ BarWidget {
     }
   }
 
+  function pronounce() {
+    if (panelLoader.item && typeof panelLoader.item.playPronunciation === "function")
+      panelLoader.item.playPronunciation()
+  }
+
   function injectPanel() {
     var target = panelLoader.item
     if (!target) return
@@ -224,6 +229,7 @@ BarWidget {
     function hide(): void { root.close() }
     function toggle(): void { root.togglePanel() }
     function search(word: string): void { root.search(word) }
+    function pronounce(): void { root.pronounce() }
   }
 
   BarIconButton {

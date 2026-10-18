@@ -31,13 +31,14 @@ var stripped = src
 // but never assigns them to module.exports (it's designed for QML's `import`).
 // We need to add explicit export lines so Node can reach them.
 var PUBLIC_SYMBOLS = [
-  "LANGUAGES","LANG_BY_VALUE","langLabel","langWikiName","defaultLanguage","languages",
-  "apiBase","lookupArgs","parseResponse","normalizeEntry","normalizeMeaning","normalizeDefinition","stringList",
+  "LANGUAGES","LANG_BY_VALUE","langLabel","langWikiName","defaultLanguage","languages","lookupLanguage",
+  "apiBase","lookupArgs","freeDictionaryArgs","myMemoryArgs","parseMyMemoryResponse","commonsAudioArgs","parseCommonsAudioUrl","parseResponse","normalizeEntry","normalizeMeaning","normalizeDefinition","stringList",
   "parseSections","stripInlineHeaders","WIKT_POS_KEYS","WIKT_SKIP_DROP",
   "wiktCanonicalPos","wiktExtractIpa","wiktIsInflectionLine","wiktExtractDefs",
   "parseWiktionaryWikitext","summaryLabel","sourceLabel","levenshtein","fuzzyMatch","setWordlist",
-  "setDataDir","websterKey","websterBucket","websterCanonicalPos","parseWebsterJson",
-  "ADAPTER_WEBSTER","ADAPTER_WIKTIONARY","ADAPTERS","adaptersFor"
+  "setDataDir","setCedictDir","setEcdictDir","ecdictKey","ecdictBucket","ecdictArgs","ecdictRecord","ecdictLines","ecdictMeanings","parseEcdictGlossResponse","parseEcdictResponse","cedictBucket","parseCedictJson","websterKey","websterBucket","websterCanonicalPos","parseWebsterJson",
+  "chineseGlossArgs","ZH_WIKT_POS","chineseDefinitionLines","parseChineseWiktionaryText","parseChineseGlossResponse",
+  "ADAPTER_FREE_DICTIONARY","ADAPTER_WEBSTER","ADAPTER_ECDICT","ADAPTER_ECDICT_GLOSS","ADAPTER_CHINESE_WIKTIONARY_GLOSS","CHINESE_GLOSS_ADAPTERS","chineseGlossAdaptersFor","ADAPTER_CEDICT","ADAPTER_MYMEMORY","ADAPTER_WIKTIONARY","ADAPTERS","adaptersFor"
 ];
 var exportLines = PUBLIC_SYMBOLS.map(function (s) { return "exports." + s + " = " + s + ";"; }).join("\n");
 
@@ -207,6 +208,37 @@ group("lookupArgs", function () {
   });
 });
 
+group("freeDictionaryArgs", function () {
+  test("builds an English v2 entry request", function () {
+    var a = M.freeDictionaryArgs("hello world", "en");
+    eq(a[0], "curl");
+    assert(a.indexOf("--connect-timeout") > -1);
+    assert(a.slice(-1)[0] === "https://api.dictionaryapi.dev/api/v2/entries/en/hello%20world");
+  });
+  test("skips empty words and non-English languages", function () {
+    deepEq(M.freeDictionaryArgs("", "en"), []);
+    deepEq(M.freeDictionaryArgs("bonjour", "fr"), []);
+  });
+});
+
+group("Commons pronunciation audio", function () {
+  test("builds an imageinfo request from a Commons curid", function () {
+    var a = M.commonsAudioArgs("https://commons.wikimedia.org/w/index.php?curid=9021983");
+    assert(a.slice(-1)[0].indexOf("pageids=9021983") > -1);
+    assert(a.slice(-1)[0].indexOf("iiprop=url") > -1);
+  });
+  test("rejects non-Commons and malformed source URLs", function () {
+    deepEq(M.commonsAudioArgs("https://example.com/?curid=1"), []);
+    deepEq(M.commonsAudioArgs("https://commons.wikimedia.org/wiki/File:hello.ogg"), []);
+  });
+  test("parses only direct Wikimedia upload URLs", function () {
+    var raw = JSON.stringify({ query: { pages: { "1": { imageinfo: [{ url: "https://upload.wikimedia.org/wikipedia/commons/a/a1/test.ogg" }] } } } });
+    eq(M.parseCommonsAudioUrl(raw), "https://upload.wikimedia.org/wikipedia/commons/a/a1/test.ogg");
+    eq(M.parseCommonsAudioUrl("not json"), "");
+    eq(M.parseCommonsAudioUrl(JSON.stringify({ query: { pages: { "1": { imageinfo: [{ url: "https://example.com/test.ogg" }] } } } })), "");
+  });
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 5 — parseResponse (empty / invalid / notfound)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -250,8 +282,8 @@ group("parseResponse — Wiktionary success", function () {
   });
 });
 
-group("parseResponse — Free Dictionary legacy", function () {
-  test("parses legacy array", function () {
+group("parseResponse — Free Dictionary", function () {
+  test("parses entry array", function () {
     var resp = JSON.stringify([{
       word: "hello", phonetic: "/hɛˈloʊ/",
       phonetics: [{ text: "/hɛˈloʊ/", audio: "" }],
@@ -260,11 +292,11 @@ group("parseResponse — Free Dictionary legacy", function () {
     var r = M.parseResponse(resp);
     eq(r.ok, true); eq(r.entry.word, "hello"); eq(r.entry.source, "dictionaryapi"); eq(r.entry.phonetic, "/hɛˈloʊ/");
   });
-  test("legacy not-found with title/message/resolution", function () {
+  test("not-found with title/message/resolution", function () {
     var r = M.parseResponse(JSON.stringify({ title: "Not Found", message: "No def", resolution: "Check spelling" }));
     eq(r.ok, false); eq(r.kind, "notfound"); eq(r.error, "No def"); eq(r.hint, "Check spelling");
   });
-  test("legacy not-found without resolution", function () {
+  test("not-found without resolution", function () {
     var r = M.parseResponse(JSON.stringify({ title: "Not Found", message: "No def" }));
     eq(r.ok, false); eq(r.kind, "notfound"); eq(r.hint, "");
   });
@@ -287,6 +319,14 @@ group("normalizeEntry", function () {
   });
   test("audioUrl from phonetics", function () {
     var r = M.normalizeEntry({ word: "t", phonetics: [{ audio: "https://x.com/a.mp3" }], meanings: [{ partOfSpeech: "n", definitions: [{ definition: "defn" }] }] });
+    eq(r.audioUrl, "https://x.com/a.mp3");
+  });
+  test("audio source URL stays paired with the selected recording", function () {
+    var r = M.normalizeEntry({ word: "t", phonetics: [{ audio: "https://x.com/a.mp3", sourceUrl: "https://commons.wikimedia.org/w/index.php?curid=1" }], meanings: [{ partOfSpeech: "n", definitions: [{ definition: "defn" }] }] });
+    eq(r.audioSourceUrl, "https://commons.wikimedia.org/w/index.php?curid=1");
+  });
+  test("protocol-relative audioUrl is made HTTPS", function () {
+    var r = M.normalizeEntry({ word: "t", phonetics: [{ audio: "//x.com/a.mp3" }], meanings: [{ partOfSpeech: "n", definitions: [{ definition: "defn" }] }] });
     eq(r.audioUrl, "https://x.com/a.mp3");
   });
   test("filters empty partOfSpeech", function () {
@@ -734,14 +774,14 @@ group("parseSections — edge cases", function () {
 // ═══════════════════════════════════════════════════════════════════════════
 group("manifest.json", function () {
   var manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
-  test("version is 1.3.0", function () { eq(manifest.version, "1.3.0"); });
+  test("version is 1.3.2", function () { eq(manifest.version, "1.3.2"); });
   test("id matches module name", function () { eq(manifest.id, "tristonarmstrong.dictionary"); });
   test("schemaVersion is 1", function () { eq(manifest.schemaVersion, 1); });
   test("kinds includes bar-widget", function () { assert(manifest.kinds.indexOf("bar-widget") > -1); });
   test("entryPoints.barWidget present", function () { eq(typeof manifest.entryPoints.barWidget, "string"); });
   test("barWidget.displayName", function () { eq(manifest.barWidget.displayName, "Dictionary"); });
   test("barWidget.allowMultiple is false", function () { eq(manifest.barWidget.allowMultiple, false); });
-  test("description mentions Wiktionary", function () { assert(manifest.description.toLowerCase().indexOf("wiktionary") > -1); });
+  test("description mentions Chinese-English", function () { assert(manifest.description.indexOf("Chinese-English") > -1); });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -986,9 +1026,9 @@ var WEBSTER_FIXTURE = JSON.stringify({
 });
 
 group("adaptersFor — chain ordering", function () {
-  test("english resolves to [webster1913, wiktionary]", function () {
+  test("english includes ECDICT before the online Wiktionary fallback", function () {
     var ids = M.adaptersFor("en").map(function (a) { return a.id; });
-    assert.deepStrictEqual(ids, ["webster1913", "wiktionary"]);
+    assert.deepStrictEqual(ids, ["dictionaryapi", "webster1913", "ecdict", "wiktionary"]);
   });
   test("other languages resolve to [wiktionary] only", function () {
     ["fr", "ja", "th", "de"].forEach(function (c) {
@@ -996,13 +1036,18 @@ group("adaptersFor — chain ordering", function () {
       assert.deepStrictEqual(ids, ["wiktionary"], c);
     });
   });
+  test("chinese resolves to offline CC-CEDICT then online translation", function () {
+    var ids = M.adaptersFor("zh").map(function (a) { return a.id; });
+    assert.deepStrictEqual(ids, ["cedict", "mymemory", "wiktionary"]);
+    assert.deepStrictEqual(M.ADAPTER_WIKTIONARY.argsFor("苹果", "zh"), []);
+  });
   test("unknown language falls back to english chain", function () {
     var ids = M.adaptersFor("xx").map(function (a) { return a.id; });
     assert.deepStrictEqual(ids, ["wiktionary"], "xx is not a webster language");
   });
   test("registry order is the fallback order", function () {
     var ids = M.ADAPTERS.map(function (a) { return a.id; });
-    assert.deepStrictEqual(ids, ["webster1913", "wiktionary"]);
+    assert.deepStrictEqual(ids, ["dictionaryapi", "webster1913", "ecdict", "cedict", "mymemory", "wiktionary"]);
   });
   test("every adapter has the full interface", function () {
     M.ADAPTERS.forEach(function (a) {
@@ -1012,6 +1057,132 @@ group("adaptersFor — chain ordering", function () {
       assert(typeof a.argsFor === "function", "argsFor");
       assert(typeof a.parse === "function", "parse");
     });
+  });
+});
+
+group("Chinese-English lookup", function () {
+  var bucket = JSON.stringify({
+    "苹果": [["Ping2 guo3", ["Apple (company)"]],
+      ["ping2 guo3", ["apple (fruit)", "CL:个[ge4]"]]],
+    "蘋果": [["ping2 guo3", ["apple (fruit)"]]]
+  });
+  test("detects Chinese input and leaves English input on the English chain", function () {
+    eq(M.lookupLanguage("苹果"), "zh");
+    eq(M.lookupLanguage("蘋果"), "zh");
+    eq(M.lookupLanguage("apple"), "en");
+  });
+  test("reads both simplified and traditional headwords from the same bucket format", function () {
+    ["苹果", "蘋果"].forEach(function (word) {
+      var result = M.parseCedictJson(bucket, word);
+      assert(result.ok);
+      eq(result.entry.word, word);
+      eq(result.entry.language, "zh");
+      eq(result.entry.phonetic, "ping2 guo3");
+      eq(result.entry.meanings[0].definitions[0].definition, "apple (fruit)");
+      eq(M.sourceLabel(result.entry), "CC-CEDICT");
+    });
+  });
+  test("common meaning precedes a proper name and classifiers are omitted", function () {
+    var result = M.parseCedictJson(bucket, "苹果");
+    deepEq(result.entry.meanings[0].definitions.map(function (d) { return d.definition; }),
+      ["apple (fruit)", "Apple (company)"]);
+  });
+  test("missing and corrupt offline entries advance the adapter chain", function () {
+    eq(M.parseCedictJson(bucket, "香蕉").kind, "notfound");
+    eq(M.parseCedictJson("bad JSON", "苹果").kind, "invalid");
+  });
+  test("offline adapter chooses a small bucket", function () {
+    M.setCedictDir("/tmp/cedict");
+    var args = M.ADAPTER_CEDICT.argsFor("苹果", "zh");
+    deepEq(args, ["gzip", "-dc", "/tmp/cedict/" + M.cedictBucket("苹果") + ".json.gz"]);
+    M.setCedictDir("");
+  });
+  test("online fallback encodes Chinese and accepts a translation", function () {
+    var args = M.myMemoryArgs("苹果", "zh");
+    assert(args[args.length - 1].indexOf("%E8%8B%B9%E6%9E%9C") > -1);
+    deepEq(M.myMemoryArgs("apple", "en"), []);
+    var result = M.parseMyMemoryResponse(JSON.stringify({
+      responseStatus: 200, responseData: { translatedText: "Apple" }
+    }), "苹果");
+    assert(result.ok);
+    eq(result.entry.meanings[0].definitions[0].definition, "Apple");
+    eq(M.sourceLabel(result.entry), "MyMemory");
+  });
+  test("online fallback rejects error and untranslated responses", function () {
+    eq(M.parseMyMemoryResponse("{}", "苹果").kind, "error");
+    eq(M.parseMyMemoryResponse("broken", "苹果").kind, "invalid");
+    eq(M.parseMyMemoryResponse(JSON.stringify({
+      responseStatus: 200, responseData: { translatedText: "苹果" }
+    }), "苹果").kind, "notfound");
+  });
+});
+
+group("offline English-Chinese lookup", function () {
+  var bucket = JSON.stringify({
+    apple: ["'æpl", "n. 苹果, 家伙\\n[医] 苹果",
+      "n. fruit of an apple tree\\nn. a cultivated apple tree"],
+    selfie: ["'sel.fi", "n. 自拍照", "n. a photo taken of oneself"]
+  });
+  test("selects a deterministic small bucket and skips missing data", function () {
+    M.setEcdictDir("/tmp/ecdict");
+    deepEq(M.ADAPTER_ECDICT.argsFor("  Apple  ", "en"),
+      ["gzip", "-dc", "/tmp/ecdict/" + M.ecdictBucket("apple") + ".json.gz"]);
+    deepEq(M.ADAPTER_ECDICT.argsFor("apple", "zh"), []);
+    M.setEcdictDir("");
+    deepEq(M.ADAPTER_ECDICT.argsFor("apple", "en"), []);
+  });
+  test("parses English definitions and Chinese meanings from one record", function () {
+    var result = M.ADAPTER_ECDICT.parse(bucket, "Apple", "en");
+    assert(result.ok);
+    eq(result.entry.source, "ecdict");
+    eq(result.entry.meanings[0].partOfSpeech, "noun");
+    eq(result.entry.meanings[0].definitions[0].definition, "fruit of an apple tree");
+    eq(result.chineseMeanings[0].partOfSpeech, "名词");
+    eq(result.chineseMeanings[0].definitions[0].definition, "苹果, 家伙");
+    eq(M.sourceLabel(result.entry), "ECDICT");
+  });
+  test("a Chinese-only record remains available without network", function () {
+    var result = M.ADAPTER_ECDICT.parse(JSON.stringify({
+      orchid: ["'ɔ:kid", "n. 兰花", ""]
+    }), "orchid", "en");
+    assert(result.ok);
+    deepEq(result.entry.meanings, []);
+    eq(result.chineseMeanings[0].definitions[0].definition, "兰花");
+  });
+  test("gloss adapter uses local Chinese before online fallback", function () {
+    deepEq(M.chineseGlossAdaptersFor("en").map(function (a) { return a.id; }),
+      ["ecdict-gloss", "wiktionary-zh-gloss"]);
+    deepEq(M.chineseGlossAdaptersFor("zh"), []);
+    var result = M.ADAPTER_ECDICT_GLOSS.parse(bucket, "apple", "en");
+    assert(result.ok);
+    eq(result.meanings[0].definitions[0].definition, "苹果, 家伙");
+  });
+  test("missing or invalid local gloss can advance to Chinese Wiktionary", function () {
+    eq(M.parseEcdictGlossResponse(bucket, "banana").kind, "notfound");
+    eq(M.parseEcdictGlossResponse("broken", "apple").kind, "invalid");
+    assert(M.ADAPTER_CHINESE_WIKTIONARY_GLOSS.argsFor("apple", "en").length > 0);
+  });
+  test("literal and real newlines both split ECDICT meanings", function () {
+    deepEq(M.ecdictLines("n. 苹果\\nv. 栽种\n[医] 苹果"),
+      ["n. 苹果", "v. 栽种", "[医] 苹果"]);
+  });
+});
+
+group("free dictionary adapter", function () {
+  test("uses the Free Dictionary endpoint for English", function () {
+    var args = M.ADAPTER_FREE_DICTIONARY.argsFor("hello", "en");
+    assert(args.slice(-1)[0].indexOf("api.dictionaryapi.dev/api/v2/entries/en/hello") > -1);
+  });
+  test("delegates parsing to the canonical response parser", function () {
+    var raw = JSON.stringify([{
+      word: "hello",
+      phonetics: [{ text: "/həˈləʊ/", audio: "https://x.com/hello.mp3" }],
+      meanings: [{ partOfSpeech: "interjection", definitions: [{ definition: "A greeting." }] }]
+    }]);
+    var r = M.ADAPTER_FREE_DICTIONARY.parse(raw, "hello", "en");
+    assert(r.ok);
+    assert.strictEqual(r.entry.source, "dictionaryapi");
+    assert.strictEqual(r.entry.audioUrl, "https://x.com/hello.mp3");
   });
 });
 

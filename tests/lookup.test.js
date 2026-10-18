@@ -32,15 +32,15 @@ var SCRIPT = path.join(__dirname, "..", "scripts", "omarchy-dictionary-lookup");
 // `extract_word` is a pure function. Call it via bash, return stdout.
 function callExtractWord(input) {
   var src = fs.readFileSync(SCRIPT, "utf8");
-  // Strip the `exec` at the bottom so the script can be sourced safely
+  // Strip both final `exec` branches so the script can be sourced safely
   // (no process spawn, no PATH lookup of wl-paste).
   var sourced = src
     .replace(/^word=.*$/m, "")
-    .replace(/^exec.*$/m, "")
+    .replace(/^\s*exec.*$/gm, "  :")
     .replace(/^set -euo pipefail$/m, "");
   // Invoke extract_word with the literal argument, capture stdout.
   var escaped = input.replace(/'/g, "'\\''");
-  var cmd = sourced + "\necho \"$(extract_word '" + escaped + "')\"\n";
+  var cmd = sourced + "\necho \"$(extract_word '" + escaped + "')\"\nexit 0\n";
   return execSync("bash", { input: cmd, encoding: "utf8" }).trim();
 }
 
@@ -120,10 +120,10 @@ var _sourcedTmp = fs.mkdtempSync(path.join(require("os").tmpdir(), "lookup-src-"
 function writeSourced(extra) {
   var src = fs.readFileSync(SCRIPT, "utf8")
     .replace(/^word=.*$/m, "")
-    .replace(/^exec.*$/m, "")
+    .replace(/^\s*exec.*$/gm, "  :")
     .replace(/^set -euo pipefail$/m, "");
   var tmp = path.join(_sourcedTmp, "src-" + Math.random().toString(36).slice(2) + ".sh");
-  fs.writeFileSync(tmp, src + "\n" + extra);
+  fs.writeFileSync(tmp, src + "\n" + extra + "\nexit 0\n");
   return tmp;
 }
 function callWaylandDisplay(envOverrides) {

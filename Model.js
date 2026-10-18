@@ -14,8 +14,8 @@
 // first lookup.
 //
 // Languages are listed roughly by coverage depth; the dropdown sorts
-// them alphabetically by English label. The Free Dictionary per-language
-// API isn't currently exercised — see apiBase below.
+// them alphabetically by English label. Free Dictionary serves English;
+// Wiktionary provides every listed language edition.
 var LANGUAGES = [
   { value: "ar", label: "Arabic",        wikiName: "Arabic" },
   { value: "bn", label: "Bengali",       wikiName: "Bengali" },
@@ -58,6 +58,10 @@ function defaultLanguage() { return "en" }
 
 function languages() { return LANGUAGES }
 
+function lookupLanguage(word) {
+  return /[\u3400-\u9fff\uf900-\ufaff]/.test(String(word || "")) ? "zh" : "en"
+}
+
 // ---- API layer ----
 //
 // URL construction for the Wiktionary MediaWiki extracts endpoint and
@@ -86,9 +90,107 @@ function lookupArgs(word, langCode) {
   ]
 }
 
+// Free Dictionary exposes modern English definitions, IPA, and pronunciation
+// audio without an API key. Keep this separate from lookupArgs(), which is
+// the multilingual Wiktionary request used later in the fallback chain.
+function freeDictionaryArgs(word, langCode) {
+  var w = String(word || "").trim()
+  var lang = String(langCode || defaultLanguage()).trim().toLowerCase() || defaultLanguage()
+  if (w === "" || lang !== "en") return []
+  return [
+    "curl", "-fsS", "--connect-timeout", "2", "--max-time", "5",
+    "-H", "User-Agent: omarchy-dictionary/1.0",
+    "https://api.dictionaryapi.dev/api/v2/entries/en/" + encodeURIComponent(w)
+  ]
+}
+
+function myMemoryArgs(word, langCode) {
+  var w = String(word || "").trim()
+  if (w === "" || langCode !== "zh") return []
+  return [
+    "curl", "-fsS", "--connect-timeout", "2", "--max-time", "7",
+    "-H", "User-Agent: omarchy-dictionary/1.0",
+    "https://api.mymemory.translated.net/get?q=" + encodeURIComponent(w) + "&langpair=zh-CN%7Cen"
+  ]
+}
+
+function parseMyMemoryResponse(stdout, word) {
+  var data = null
+  try { data = JSON.parse(String(stdout || "")) } catch (e) {
+    return { ok: false, kind: "invalid", error: "invalid translation response" }
+  }
+  if (!data || Number(data.responseStatus) !== 200 || !data.responseData)
+    return { ok: false, kind: "error", error: "translation service unavailable" }
+  var translation = String(data.responseData.translatedText || "").trim()
+  translation = translation.replace(/&amp;/g, "&").replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+  if (translation === "" || translation === String(word || "").trim() ||
+      /MYMEMORY WARNING/i.test(translation))
+    return { ok: false, kind: "notfound", error: "no English translation" }
+  return { ok: true, entry: {
+    word: String(word || "").trim(), phonetic: "", audioUrl: "",
+    source: "mymemory", language: "zh", meanings: [{
+      partOfSpeech: "English translation",
+      definitions: [{ definition: translation, example: "", synonyms: [], antonyms: [] }],
+      synonyms: [], antonyms: []
+    }]
+  } }
+}
+
+// Fetch the same English headword from Chinese Wiktionary. This is a
+// secondary enrichment request: its Chinese definitions are displayed next
+// to the English entry, never used to decide whether the main lookup won.
+function chineseGlossArgs(word) {
+  var w = String(word || "").trim()
+  if (w === "") return []
+  return [
+    "curl", "-fsS", "--connect-timeout", "2", "--max-time", "5",
+    "-H", "User-Agent: omarchy-dictionary/1.0",
+    "https://zh.wiktionary.org/w/api.php?action=query&prop=extracts&explaintext=1&format=json&variant=zh-hans&titles="
+      + encodeURIComponent(w)
+  ]
+}
+
+// Free Dictionary returns a Wikimedia Commons description-page URL alongside
+// each recording. Resolve its numeric page id through the Commons API so the
+// player can use upload.wikimedia.org directly instead of depending on the
+// API's occasionally unavailable audio proxy.
+function commonsAudioArgs(sourceUrl) {
+  var source = String(sourceUrl || "").trim()
+  if (source.indexOf("https://commons.wikimedia.org/w/index.php?") !== 0) return []
+  var match = source.match(/[?&]curid=([0-9]+)/)
+  if (!match) return []
+  return [
+    "curl", "-fsS", "--connect-timeout", "2", "--max-time", "5",
+    "-H", "User-Agent: omarchy-dictionary/1.0",
+    "https://commons.wikimedia.org/w/api.php?action=query&format=json&pageids="
+      + match[1] + "&prop=imageinfo&iiprop=url"
+  ]
+}
+
+function parseCommonsAudioUrl(stdout) {
+  var text = String(stdout || "").trim()
+  if (text === "") return ""
+  var data = null
+  try {
+    data = JSON.parse(text)
+  } catch (e) {
+    return ""
+  }
+  var pages = data && data.query && data.query.pages
+  if (!pages || typeof pages !== "object") return ""
+  var ids = Object.keys(pages)
+  for (var i = 0; i < ids.length; i++) {
+    var info = pages[ids[i]] && pages[ids[i]].imageinfo
+    var url = info && info[0] ? String(info[0].url || "").trim() : ""
+    if (url.indexOf("https://upload.wikimedia.org/") === 0) return url
+  }
+  return ""
+}
+
 // ---- Response parsing & normalisation ----
 //
-// Turns raw API response text (or legacy Free Dictionary JSON) into the
+// Turns raw Wiktionary or Free Dictionary API response text into the
 // canonical { word, phonetic, audioUrl, source, language, meanings } shape.
 // The Wiktionary branch delegates the heavy lifting to the extract parser
 // below; the Free Dictionary branch normalises in place.
@@ -131,9 +233,8 @@ function parseResponse(raw, langCode) {
     return { ok: true, entry: entry, variants: pageIds.length }
   }
 
-  // Free Dictionary legacy shapes — preserved so rollback is a one-line
-  // change. The legacy Free Dictionary used a top-level JSON array of
-  // entries with `title`/`message` for not-found responses.
+  // Free Dictionary uses a top-level array of entries and a title/message
+  // object for not-found responses.
   if (!Array.isArray(data) && data.title && data.message) {
     return {
       ok: false,
@@ -177,26 +278,33 @@ function normalizeEntry(raw, langCode) {
   if (word === "") return null
 
   var phonetic = String(raw.phonetic || "").trim()
-  if (phonetic === "" && Array.isArray(raw.phonetics)) {
+  var audioUrl = ""
+  var audioSourceUrl = ""
+  var audioIndex = -1
+  var audioWithTextIndex = -1
+  if (Array.isArray(raw.phonetics)) {
     for (var i = 0; i < raw.phonetics.length; i++) {
       var p = raw.phonetics[i]
-      if (p && typeof p === "object" && p.text) {
-        phonetic = String(p.text).trim()
-        if (phonetic !== "") break
-      }
+      if (!p || typeof p !== "object") continue
+      var pText = String(p.text || "").trim()
+      var pAudio = String(p.audio || "").trim()
+      if (phonetic === "" && pText !== "") phonetic = pText
+      if (pAudio !== "" && audioIndex < 0) audioIndex = i
+      if (pAudio !== "" && pText !== "" && audioWithTextIndex < 0) audioWithTextIndex = i
+    }
+    // Prefer a recording that carries its own IPA. This keeps the displayed
+    // transcription and spoken accent paired and avoids lower-quality
+    // audio-only records when a complete alternative is available.
+    var selectedAudioIndex = audioWithTextIndex >= 0 ? audioWithTextIndex : audioIndex
+    if (selectedAudioIndex >= 0) {
+      var selected = raw.phonetics[selectedAudioIndex]
+      audioUrl = String(selected.audio || "").trim()
+      audioSourceUrl = String(selected.sourceUrl || "").trim()
+      var selectedText = String(selected.text || "").trim()
+      if (selectedText !== "") phonetic = selectedText
     }
   }
-
-  var audioUrl = ""
-  if (Array.isArray(raw.phonetics)) {
-    for (var j = 0; j < raw.phonetics.length; j++) {
-      var ph = raw.phonetics[j]
-      if (ph && typeof ph === "object" && ph.audio && String(ph.audio).trim() !== "") {
-        audioUrl = String(ph.audio).trim()
-        break
-      }
-    }
-  }
+  if (audioUrl.indexOf("//") === 0) audioUrl = "https:" + audioUrl
 
   var meanings = []
   if (Array.isArray(raw.meanings)) {
@@ -212,7 +320,9 @@ function normalizeEntry(raw, langCode) {
     word: word,
     phonetic: phonetic,
     audioUrl: audioUrl,
+    audioSourceUrl: audioSourceUrl,
     source: "dictionaryapi",
+    language: String(langCode || defaultLanguage()).trim().toLowerCase() || defaultLanguage(),
     meanings: meanings
   }
 }
@@ -302,6 +412,114 @@ function parseSections(text) {
     }
   }
   return root.children
+}
+
+var ZH_WIKT_POS = {
+  "名词": "名词", "名詞": "名词",
+  "动词": "动词", "動詞": "动词",
+  "形容词": "形容词", "形容詞": "形容词",
+  "副词": "副词", "副詞": "副词",
+  "代词": "代词", "代詞": "代词",
+  "介词": "介词", "介詞": "介词",
+  "连词": "连词", "連詞": "连词",
+  "感叹词": "感叹词", "感嘆詞": "感叹词",
+  "数词": "数词", "數詞": "数词",
+  "冠词": "冠词", "冠詞": "冠词",
+  "限定词": "限定词", "限定詞": "限定词",
+  "短语": "短语", "短語": "短语",
+  "专有名词": "专有名词", "專有名詞": "专有名词"
+}
+
+function chineseDefinitionLines(headword, body) {
+  var lines = String(body || "").replace(/\r\n/g, "\n").split("\n")
+  var out = []
+  var seen = {}
+  var word = String(headword || "").trim().toLowerCase()
+  for (var i = 0; i < lines.length && out.length < 4; i++) {
+    var line = lines[i].replace(/^\s*[#*:]+\s*/, "").trim()
+    if (line === "" || line.toLowerCase().indexOf(word) === 0) continue
+    if (/^(?:Template:|[12][0-9]{3}\b|c\.\s*[12][0-9]{3}\b)/i.test(line)) continue
+    var han = line.match(/[\u3400-\u9fff]/g)
+    if (!han || han.length < 2 || line.length > 220) continue
+    if (/^(同义词|同義詞|反义词|反義詞|参见|參見|参考|參考|词源|詞源|发音|發音|英语发音|英語發音|韵部|韻部|同音词|同音詞)[：:]?/.test(line)) continue
+    if (!seen[line]) {
+      seen[line] = true
+      out.push({ definition: line, example: "", synonyms: [], antonyms: [] })
+    }
+  }
+  return out
+}
+
+function parseChineseWiktionaryText(headword, rawText) {
+  var top = parseSections(rawText)
+  var english = null
+  for (var i = 0; i < top.length; i++) {
+    var title = String(top[i].title || "").trim()
+    if (title === "英语" || title === "英語" || title === "英文") {
+      english = top[i]
+      break
+    }
+  }
+  if (!english) {
+    // Some older Chinese Wiktionary pages keep a short English gloss inside
+    // the cross-language pronunciation section instead of an English
+    // language section. Use only that narrow fallback to avoid mistaking a
+    // later language's definition for the requested English meaning.
+    for (var j = 0; j < top.length; j++) {
+      var crossTitle = String(top[j].title || "").trim()
+      if (crossTitle !== "跨语言" && crossTitle !== "跨語言") continue
+      for (var k = 0; k < top[j].children.length; k++) {
+        var childTitle = String(top[j].children[k].title || "").trim()
+        if (childTitle !== "发音" && childTitle !== "發音") continue
+        var fallbackDefs = chineseDefinitionLines(headword, top[j].children[k].body)
+        if (fallbackDefs.length) return [{
+          partOfSpeech: "释义",
+          definitions: fallbackDefs,
+          synonyms: [],
+          antonyms: []
+        }]
+      }
+    }
+    return []
+  }
+
+  var meanings = []
+  function visit(node) {
+    var title = String(node.title || "").trim().replace(/\s+[0-9]+$/, "")
+    var pos = ZH_WIKT_POS[title]
+    if (pos) {
+      var defs = chineseDefinitionLines(headword, node.body)
+      if (defs.length) meanings.push({
+        partOfSpeech: pos,
+        definitions: defs,
+        synonyms: [],
+        antonyms: []
+      })
+    }
+    for (var i = 0; i < node.children.length; i++) visit(node.children[i])
+  }
+  for (var i = 0; i < english.children.length; i++) visit(english.children[i])
+  return meanings.slice(0, 4)
+}
+
+function parseChineseGlossResponse(stdout, word) {
+  var text = String(stdout || "").trim()
+  if (text === "") return { ok: false, kind: "empty", error: "empty response" }
+  var data = null
+  try {
+    data = JSON.parse(text)
+  } catch (e) {
+    return { ok: false, kind: "invalid", error: "could not parse response" }
+  }
+  var pages = data && data.query && data.query.pages
+  if (!pages || typeof pages !== "object") return { ok: false, kind: "invalid", error: "invalid response" }
+  var ids = Object.keys(pages)
+  if (!ids.length || !pages[ids[0]] || pages[ids[0]].missing !== undefined)
+    return { ok: false, kind: "notfound", error: "no Chinese entry" }
+  var page = pages[ids[0]]
+  var meanings = parseChineseWiktionaryText(page.title || word, page.extract || "")
+  if (!meanings.length) return { ok: false, kind: "empty", error: "no Chinese definitions" }
+  return { ok: true, meanings: meanings }
 }
 
 function stripInlineHeaders(text) {
@@ -554,6 +772,9 @@ function sourceLabel(entry) {
   if (entry.source === "wiktionary") return "Wiktionary"
   if (entry.source === "dictionaryapi") return "Free Dictionary"
   if (entry.source === "webster1913") return "Webster's 1913"
+  if (entry.source === "ecdict") return "ECDICT"
+  if (entry.source === "cedict") return "CC-CEDICT"
+  if (entry.source === "mymemory") return "MyMemory"
   return String(entry.source)
 }
 
@@ -725,9 +946,165 @@ function fuzzyMatch(rawQuery) {
 // means no local data available; the local adapter then yields no argv and
 // the chain skips straight to the network.
 var _DATA_DIR = ""
+var _CEDICT_DIR = ""
+var _ECDICT_DIR = ""
 
 function setDataDir(dir) {
   _DATA_DIR = String(dir || "")
+}
+
+function setCedictDir(dir) {
+  _CEDICT_DIR = String(dir || "")
+}
+
+function setEcdictDir(dir) {
+  _ECDICT_DIR = String(dir || "")
+}
+
+function ecdictKey(word) {
+  return String(word || "").trim().toLowerCase().replace(/\s+/g, " ")
+}
+
+// A low-byte rolling hash keeps the 767K translated headwords in 256 small
+// buckets. JS charCodeAt uses UTF-16 units; build-ecdict.py uses the same units.
+function ecdictBucket(word) {
+  var key = ecdictKey(word)
+  if (key === "") return ""
+  var hash = 0
+  for (var i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) & 255
+  var hex = hash.toString(16)
+  return hex.length === 1 ? "0" + hex : hex
+}
+
+function ecdictArgs(word, lang) {
+  var key = ecdictKey(word)
+  if (key === "" || lang !== "en" || _ECDICT_DIR === "") return []
+  return ["gzip", "-dc", _ECDICT_DIR + "/" + ecdictBucket(key) + ".json.gz"]
+}
+
+function ecdictRecord(stdout, word) {
+  var data = null
+  try { data = JSON.parse(String(stdout || "")) } catch (e) {
+    return { ok: false, kind: "invalid", error: "invalid English-Chinese dictionary data" }
+  }
+  var record = data && data[ecdictKey(word)]
+  if (!Array.isArray(record) || record.length < 3)
+    return { ok: false, kind: "notfound", error: "no English-Chinese entry" }
+  return { ok: true, record: record }
+}
+
+function ecdictLines(raw) {
+  return String(raw || "").split(/\\n|\n/).map(function (line) { return line.trim() })
+    .filter(function (line) { return line !== "" })
+}
+
+function ecdictMeanings(raw, chinese) {
+  var lines = ecdictLines(raw)
+  var meanings = []
+  var byPos = Object.create(null)
+  var posNames = {
+    n: "noun", v: "verb", vi: "verb", vt: "verb", a: "adjective",
+    adj: "adjective", adv: "adverb", prep: "preposition",
+    pron: "pronoun", conj: "conjunction", interj: "interjection"
+  }
+  var chineseNames = {
+    noun: "名词", verb: "动词", adjective: "形容词", adverb: "副词",
+    preposition: "介词", pronoun: "代词", conjunction: "连词",
+    interjection: "感叹词"
+  }
+  for (var i = 0; i < lines.length && i < 24; i++) {
+    var line = lines[i]
+    var pos = chinese ? "释义" : "definition"
+    var match = line.match(/^([a-z]{1,7})\.\s*(.+)$/i)
+    if (match) {
+      var canonical = posNames[match[1].toLowerCase()]
+      if (canonical) {
+        pos = chinese ? chineseNames[canonical] : canonical
+        line = match[2]
+      }
+    } else if (chinese) {
+      var label = line.match(/^\[([^\]]{1,12})\]\s*(.+)$/)
+      if (label) {
+        pos = label[1]
+        line = label[2]
+      }
+    }
+    if (!line) continue
+    if (!byPos[pos]) {
+      byPos[pos] = { partOfSpeech: pos, definitions: [], synonyms: [], antonyms: [] }
+      meanings.push(byPos[pos])
+    }
+    byPos[pos].definitions.push({ definition: line, example: "", synonyms: [], antonyms: [] })
+  }
+  return meanings
+}
+
+function parseEcdictGlossResponse(stdout, word) {
+  var found = ecdictRecord(stdout, word)
+  if (!found.ok) return found
+  var meanings = ecdictMeanings(found.record[1], true)
+  if (!meanings.length) return { ok: false, kind: "empty", error: "no local Chinese gloss" }
+  return { ok: true, meanings: meanings }
+}
+
+function parseEcdictResponse(stdout, word) {
+  var found = ecdictRecord(stdout, word)
+  if (!found.ok) return found
+  var meanings = ecdictMeanings(found.record[2], false)
+  var chineseMeanings = ecdictMeanings(found.record[1], true)
+  if (!meanings.length && !chineseMeanings.length)
+    return { ok: false, kind: "empty", error: "no local definition" }
+  return { ok: true, entry: {
+    word: String(word || "").trim(), phonetic: String(found.record[0] || ""),
+    audioUrl: "", source: "ecdict", language: "en", meanings: meanings
+  }, chineseMeanings: chineseMeanings }
+}
+
+function cedictBucket(word) {
+  var w = String(word || "").trim()
+  if (w === "") return ""
+  var code = w.charCodeAt(0)
+  var hex = (code & 255).toString(16)
+  return hex.length === 1 ? "0" + hex : hex
+}
+
+function parseCedictJson(stdout, word) {
+  var data = null
+  try { data = JSON.parse(String(stdout || "")) } catch (e) {
+    return { ok: false, kind: "invalid", error: "invalid Chinese dictionary data" }
+  }
+  var key = String(word || "").trim()
+  var records = data && data[key]
+  if (!Array.isArray(records) || !records.length)
+    return { ok: false, kind: "notfound", error: "no entry for \"" + key + "\"" }
+  // CC-CEDICT can list a proper name before the everyday sense of the same
+  // headword (for example, Apple Inc. before the fruit). Prefer lowercase
+  // glosses, which are usually common-word meanings.
+  var ordered = records.slice().sort(function (a, b) {
+    var firstA = a && a[1] && a[1][0] ? String(a[1][0]) : ""
+    var firstB = b && b[1] && b[1][0] ? String(b[1][0]) : ""
+    return Number(/^[A-Z]/.test(firstA)) - Number(/^[A-Z]/.test(firstB))
+  })
+  var definitions = []
+  var seen = {}
+  var pinyin = ""
+  for (var i = 0; i < ordered.length && definitions.length < 24; i++) {
+    var record = ordered[i]
+    if (!Array.isArray(record) || !Array.isArray(record[1])) continue
+    if (pinyin === "") pinyin = String(record[0] || "")
+    for (var j = 0; j < record[1].length && definitions.length < 24; j++) {
+      var gloss = String(record[1][j] || "").trim()
+      if (gloss === "" || /^CL:/i.test(gloss) || seen[gloss]) continue
+      seen[gloss] = true
+      definitions.push({ definition: gloss, example: "", synonyms: [], antonyms: [] })
+    }
+  }
+  if (!definitions.length) return { ok: false, kind: "empty", error: "no English translation" }
+  return { ok: true, entry: {
+    word: key, phonetic: pinyin, audioUrl: "", source: "cedict", language: "zh",
+    meanings: [{ partOfSpeech: "English translation", definitions: definitions,
+      synonyms: [], antonyms: [] }]
+  } }
 }
 
 // Normalize a lookup word to the key scheme scripts/build-webster.py used:
@@ -834,11 +1211,74 @@ var ADAPTER_WEBSTER = {
   }
 }
 
+var ADAPTER_FREE_DICTIONARY = {
+  id: "dictionaryapi",
+  label: "Free Dictionary",
+  languages: ["en"],
+  argsFor: function (word, lang) {
+    return freeDictionaryArgs(word, lang)
+  },
+  parse: function (stdout, word, lang) {
+    return parseResponse(stdout, lang)
+  }
+}
+
+var ADAPTER_ECDICT = {
+  id: "ecdict",
+  label: "ECDICT",
+  languages: ["en"],
+  argsFor: function (word, lang) { return ecdictArgs(word, lang) },
+  parse: function (stdout, word, lang) { return parseEcdictResponse(stdout, word) }
+}
+
+var ADAPTER_ECDICT_GLOSS = {
+  id: "ecdict-gloss",
+  label: "ECDICT",
+  languages: ["en"],
+  argsFor: function (word, lang) { return ecdictArgs(word, lang) },
+  parse: function (stdout, word, lang) { return parseEcdictGlossResponse(stdout, word) }
+}
+
+var ADAPTER_CHINESE_WIKTIONARY_GLOSS = {
+  id: "wiktionary-zh-gloss",
+  label: "Chinese Wiktionary",
+  languages: ["en"],
+  argsFor: function (word, lang) { return chineseGlossArgs(word) },
+  parse: function (stdout, word, lang) { return parseChineseGlossResponse(stdout, word) }
+}
+
+var CHINESE_GLOSS_ADAPTERS = [ADAPTER_ECDICT_GLOSS, ADAPTER_CHINESE_WIKTIONARY_GLOSS]
+
+function chineseGlossAdaptersFor(langCode) {
+  return langCode === "en" ? CHINESE_GLOSS_ADAPTERS : []
+}
+
+var ADAPTER_CEDICT = {
+  id: "cedict",
+  label: "CC-CEDICT",
+  languages: ["zh"],
+  argsFor: function (word, lang) {
+    var key = String(word || "").trim()
+    if (key === "" || _CEDICT_DIR === "") return []
+    return ["gzip", "-dc", _CEDICT_DIR + "/" + cedictBucket(key) + ".json.gz"]
+  },
+  parse: function (stdout, word, lang) { return parseCedictJson(stdout, word) }
+}
+
+var ADAPTER_MYMEMORY = {
+  id: "mymemory",
+  label: "MyMemory",
+  languages: ["zh"],
+  argsFor: function (word, lang) { return myMemoryArgs(word, lang) },
+  parse: function (stdout, word, lang) { return parseMyMemoryResponse(stdout, word) }
+}
+
 var ADAPTER_WIKTIONARY = {
   id: "wiktionary",
   label: "Wiktionary",
   languages: ["*"],
   argsFor: function (word, lang) {
+    if (lang === "zh") return []
     return lookupArgs(word, lang)
   },
   parse: function (stdout, word, lang) {
@@ -846,10 +1286,11 @@ var ADAPTER_WIKTIONARY = {
   }
 }
 
-// Registry order IS the fallback chain order. English resolves to
-// [webster1913, wiktionary] — offline-first with a network fallback;
-// every other language resolves to [wiktionary].
-var ADAPTERS = [ADAPTER_WEBSTER, ADAPTER_WIKTIONARY]
+// Registry order IS the fallback chain order. English prefers the modern
+// Free Dictionary response (including IPA/audio), then bundled Webster and
+// ECDICT data, and finally Wiktionary. Chinese uses CC-CEDICT and MyMemory.
+var ADAPTERS = [ADAPTER_FREE_DICTIONARY, ADAPTER_WEBSTER, ADAPTER_ECDICT, ADAPTER_CEDICT,
+  ADAPTER_MYMEMORY, ADAPTER_WIKTIONARY]
 
 function adaptersFor(langCode) {
   var lang = String(langCode || defaultLanguage()).trim().toLowerCase() || defaultLanguage()

@@ -3,10 +3,11 @@
 Decisions locked for this plugin. Read this before changing anything; it
 caps the traps agents keep hitting in this specific repo.
 
-This directory is a `git` clone that **is** the live Omarchy shell plugin
-at `~/.config/omarchy/plugins/tristonarmstrong.dictionary`. Switching
-branches changes the running plugin. Files under `data/webster/` are
-generated; do not hand-edit them.
+This directory is a `git` clone. On this machine the live Omarchy shell plugin
+at `~/.config/omarchy/plugins/tristonarmstrong.dictionary` is a **separate**
+clone; copy validated changes there and reload the shell to deploy them.
+Files under `data/webster/`, `data/cedict/`, and `data/ecdict/` are generated;
+do not hand-edit their dictionary buckets.
 
 ## Run the tests before and after any change
 
@@ -15,8 +16,7 @@ bash tests/run.sh
 ```
 
 Full taxonomy: `lint.test.js`, `model.test.js`, `lookup.test.js`,
-`install.test.js`. Current baseline: lint 2/2, model 273/273, lookup 41/41,
-install 25/25. All must be green before a push.
+`install.test.js`. All must be green before a push.
 
 - `Model.js` is QML-loaded JavaScript. **No `const`/`let`** — the engine
   requires `var` (lint enforces this). Top-level declarations only.
@@ -40,8 +40,11 @@ plain object:
 ```
 
 - `ADAPTERS` registry **order IS the fallback chain order**. English resolves
-  to `[webster1913, wiktionary]` (offline-first, network fallback); every
-  other language to `[wiktionary]` via `adaptersFor(lang)`.
+  to `[dictionaryapi, webster1913, ecdict, wiktionary]`; Chinese resolves to
+  `[cedict, mymemory]` (the trailing generic Wiktionary adapter skips Chinese);
+  other languages resolve to `[wiktionary]` via `adaptersFor(lang)`.
+- English results get Chinese definitions through a separate enrichment chain:
+  `[ecdict-gloss, wiktionary-zh-gloss]`. The local source is tried first.
 - The panel tries the chain in order: first `ok` wins; `notfound`/`empty`/
   `invalid`/process-failure advances; an exhausted chain falls back to the
   existing fuzzy-recovery / notfound UI.
@@ -56,6 +59,16 @@ plain object:
 normalized lowercased/collapsed-whitespace. A bucket decompresses to up to
 ~1 MB, so the panel streams it through a `gzip -dc` Process and parses
 stdout — never read a bucket whole into memory.
+
+`scripts/build-cedict.py` produces 256 small `data/cedict/<hex>.json.gz`
+buckets from CC-CEDICT. Both simplified and traditional spellings are indexed.
+The generated data is CC BY-SA 4.0; attribution is in
+`data/cedict/LICENSE-DATA.txt`.
+
+`scripts/build-ecdict.py` produces 256 `data/ecdict/<hex>.json.gz` buckets
+from ECDICT's CSV. These provide offline Chinese definitions for English
+headwords, including entries with no English definition. The bundled data
+retains ECDICT's MIT notice in `data/ecdict/LICENSE-DATA.txt`.
 
 Known issue: ~12.6% of headwords carry literal U+FFFD in their phonetic
 field (upstream GCIDE data loss, not a build-script bug — the build decodes

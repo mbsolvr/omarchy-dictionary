@@ -1,19 +1,22 @@
 # Omarchy Dictionary
 
-A Quickshell bar widget for Omarchy that looks up word definitions, with
-support for 23 language editions, fuzzy "did you mean?" suggestions, and a
-global hotkey for looking up highlighted text anywhere on your system.
+A bilingual dictionary for the Omarchy bar. English words show English and
+Chinese definitions; Chinese words show English translations. It also offers
+IPA, pronunciation audio for available English entries, fuzzy English
+suggestions, and a global hotkey for highlighted text.
 
-English works fully offline via a bundled Webster's 1913 dictionary; other
-editions use Wiktionary over the network. Dictionary sources are pluggable
-adapters tried in order — English resolves to
-`[Webster's 1913 → Wiktionary]`, so a word missing from the 1913 text (or
-any local miss) falls back to the network when you're online.
+English prefers the Free Dictionary API for modern definitions, IPA, and
+pronunciation audio, then falls back to the bundled Webster's 1913 and ECDICT
+dictionaries, followed by English Wiktionary. After an English entry succeeds,
+its Chinese definitions come from bundled ECDICT data; Chinese Wiktionary is
+queried only when ECDICT has no matching translation. This enrichment does not
+block or replace the English entry or its pronunciation. Chinese headwords use
+the bundled CC-CEDICT Chinese-English dictionary first. Words and phrases
+missing from CC-CEDICT use MyMemory as an online translation fallback.
 
-Click the bar icon to open a search field. Type a word and press Enter to
-look it up. Use the language dropdown in the panel header to switch editions
-between [supported languages](#supported-languages). When no match exists,
-up to three similar words are suggested as clickable chips.
+Click the bar icon to open a search field. Type an English or Chinese word and press
+Enter to look it up. When no match exists, up to three similar words are
+suggested as clickable chips.
 
 ![Dictionary preview](preview.png)
 
@@ -21,9 +24,13 @@ up to three similar words are suggested as clickable chips.
 
 - Omarchy (uses the Quickshell bar plugin system)
 - `wl-clipboard` for the global selection hotkey — preinstalled on Omarchy
-- Network access to `*.wiktionary.org` — only needed for non-English
-  editions and as a fallback when a word isn't in the offline dictionary;
-  English lookups work with no network at all
+- `ffmpeg` and PipeWire's `pw-play` for reliable pronunciation playback —
+  both are included with Omarchy
+- Network access is optional. It adds modern English definitions and audio via
+  `api.dictionaryapi.dev`, a final English fallback via `en.wiktionary.org`,
+  Chinese definitions for words absent from ECDICT via `zh.wiktionary.org`, and
+  Chinese-English translation for words absent from CC-CEDICT via
+  `api.mymemory.translated.net`.
 
 ## Offline support
 
@@ -31,7 +38,12 @@ English definitions ship with the plugin: 108,181 headwords from
 Webster's New International Dictionary (1913), via the GCIDE XML dataset,
 compressed into per-letter files under `data/webster/` (~6 MB total).
 Lookups read the one relevant letter file with `gzip` — no new runtime
-dependencies.
+dependencies. English-Chinese translations ship as 256 ECDICT buckets under
+`data/ecdict/` (~29 MB), covering 767,533 English headwords. Chinese-English
+translations ship as 256 CC-CEDICT buckets under `data/cedict/` (~6 MB). Both
+simplified and traditional Chinese headwords are indexed. ECDICT data carries
+an MIT license notice in `data/ecdict/LICENSE-DATA.txt`; CC-CEDICT data is
+licensed CC BY-SA 4.0, with attribution in `data/cedict/LICENSE-DATA.txt`.
 
 Dictionary sources are adapters (`Model.js`: `ADAPTERS`). Each adapter
 declares the languages it serves plus an `argsFor`/`parse` pair, and the
@@ -47,6 +59,20 @@ scripts/build-webster.py   # downloads GCIDE XML, writes data/webster/*.json.gz
 The raw XML is gitignored; only the generated files are committed.
 Licensing: the 1913 Webster's core text is public domain, but GCIDE's
 markup and additions are GPL — see `data/webster/LICENSE-DATA.txt`.
+
+To rebuild the Chinese-English data from an official CC-CEDICT release:
+
+```sh
+curl -fsSL -o /tmp/cedict.txt.gz https://www.mdbg.net/chinese/export/cedict/cedict_1_0_ts_utf-8_mdbg.txt.gz
+python3 scripts/build-cedict.py /tmp/cedict.txt.gz
+```
+
+To rebuild the English-Chinese data from ECDICT's CSV:
+
+```sh
+curl -fsSL -o /tmp/ecdict.csv https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.csv
+python3 scripts/build-ecdict.py /tmp/ecdict.csv
+```
 
 ## Install
 
@@ -65,8 +91,9 @@ omarchy bar move tristonarmstrong.dictionary --section center --after omarchy.cl
 ### Bar search
 
 - Click the bar icon to open the search panel
-- Type a word and press Enter to look it up
-- Use the language dropdown in the panel header to switch editions
+- Type an English or Chinese word and press Enter to look it up
+- English results show Chinese definitions first, followed by English definitions
+- Chinese results show English translations and pinyin when available
 - When no match exists, up to three similar words appear as chips you can
   click to retry
 - Press Esc to close the panel
@@ -130,9 +157,8 @@ qmllint -I "$OMARCHY_PATH/shell" \
 bash tests/run.sh
 ```
 
-Runs four suites — QML lint checks (2), Model.js unit tests (273),
-the lookup-script tests (41), and the install-stage tests (25) — 341 tests
-total. Model.js is parsed
+Runs four suites — QML lint checks, Model.js unit tests, lookup-script tests,
+and install-stage tests. Model.js is parsed
 in-process; the lookup script's pure functions are exercised in a
 subprocess with stubbed `wl-paste` and `omarchy-shell` so the suite
 needs no Wayland session or running shell.
@@ -148,38 +174,9 @@ rm ~/.local/bin/omarchy-dictionary-lookup
 `~/.local/bin/omarchy-dictionary-lookup` stays (the plugin doesn't know
 when it's being removed). Remove it manually with the second command.
 
-## Supported languages
-
-23 Wiktionary editions, alphabetically by English label:
-
-| Language | Code |
-|---|---|
-| Arabic | `ar` |
-| Bengali | `bn` |
-| Chinese | `zh` |
-| Dutch | `nl` |
-| English | `en` |
-| French | `fr` |
-| German | `de` |
-| Hindi | `hi` |
-| Indonesian | `id` |
-| Italian | `it` |
-| Japanese | `ja` |
-| Korean | `ko` |
-| Malay | `ms` |
-| Persian | `fa` |
-| Polish | `pl` |
-| Portuguese | `pt` |
-| Russian | `ru` |
-| Spanish | `es` |
-| Swahili | `sw` |
-| Swedish | `sv` |
-| Thai | `th` |
-| Turkish | `tr` |
-| Vietnamese | `vi` |
-
-To add another edition, append it to the `LANGUAGES` array in `Model.js`.
-
 ## License
 
-MIT.
+Plugin code is MIT licensed. The bundled Webster data follows the terms in
+`data/webster/LICENSE-DATA.txt`; ECDICT data retains the upstream MIT notice
+in `data/ecdict/LICENSE-DATA.txt`; CC-CEDICT data is CC BY-SA 4.0 and follows
+`data/cedict/LICENSE-DATA.txt`.
